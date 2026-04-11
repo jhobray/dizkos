@@ -1,465 +1,596 @@
-import type {
-  FrameLandmarks,
-  SimplePoint,
-  OverlayFrame,
-  OverlayPoint,
-  BiomechanicsResult,
-  BiomechanicsMetrics,
-  MetricBand,
-  RiskLevel,
-} from "./types";
-import type { Athlete } from "./athletes";
+// ============================================================
+// DIZKOS — Motor Biomecánico v2.0
+// El motor de análisis de running más avanzado del mercado
+// ============================================================
 
-// ─── Utilidades ───────────────────────────────────────────────────────────────
+import type { FrameLandmarks, SimplePoint } from "./types";
 
-export function clamp(v: number, min: number, max: number): number {
+// ─── TIPOS ───────────────────────────────────────────────────
+
+export type MetricBand = "Bajo" | "Media" | "Alta";
+export type RiskLevel = "Bajo" | "Medio" | "Alto" | "Crítico";
+
+export interface OverstrideResult {
+  value: number;          // ratio 0–1 (horizontal ankle-hip / height)
+  label: "Eficiente" | "Moderado" | "Severo";
+  risk: "Bajo" | "Medio" | "Alto";
+}
+
+export interface HipDropResult {
+  value: number;          // diferencia normalizada
+  label: "Estable" | "Leve" | "Moderado" | "Severo";
+  side: "izquierdo" | "derecho" | "simétrico";
+}
+
+export interface AsymmetryResult {
+  value: number;          // 0–1 porcentaje diferencia
+  label: "Mínima" | "Leve" | "Significativa" | "Severa";
+}
+
+export interface TrunkResult {
+  angleDeg: number;
+  label: "Vertical" | "Inclinado adelante" | "Inclinado atrás" | "Flexión excesiva";
+}
+
+export interface ImpactResult {
+  pattern: "Talón" | "Mediopié" | "Antepié" | "Indeterminado";
+  risk: "Bajo" | "Medio" | "Alto";
+  label: string;
+}
+
+export interface BiomechanicsMetrics {
+  cadence: number;
+  overstride: OverstrideResult;
+  hipDrop: HipDropResult;
+  asymmetry: AsymmetryResult;
+  trunkPosition: TrunkResult;
+  impactControl: ImpactResult;
+}
+
+export interface BiomechanicsResult {
+  technicalScore: number;          // 0–100
+  riskLevel: RiskLevel;
+  riskScore: number;               // 0–100
+  priorityFocus: string;
+  cadence: number;
+  metrics: BiomechanicsMetrics;
+  naturalLanguageDiagnosis: string;
+  readinessAdjustment: number;     // -1 a +1 ajuste de carga
+  coachCues: string[];             // frases para modo coach en vivo
+}
+
+// ─── UTILIDADES ──────────────────────────────────────────────
+
+function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
 }
 
-export function mean(values: number[]): number {
+function mean(values: number[]): number {
   if (!values.length) return 0;
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
-function avgPoint(a: SimplePoint, b: SimplePoint): SimplePoint {
-  return {
-    x: (a.x + b.x) / 2,
-    y: (a.y + b.y) / 2,
-    visibility: (a.visibility + b.visibility) / 2,
-  };
+function smoothSeries(values: number[], windowSize = 5): number[] {
+  return values.map((_, i) => {
+    const start = Math.max(0, i - Math.floor(windowSize / 2));
+    const end = Math.min(values.length, start + windowSize);
+    return mean(values.slice(start, end));
+  });
 }
 
-function band(v: number, low: number, high: number): MetricBand {
-  if (v >= high) return "Alta";
-  if (v >= low) return "Media";
-  return "Baja";
+function detectPeaks(series: number[]): number[] {
+  const peaks: number[] = [];
+  for (let i = 1; i < series.length - 1; i++) {
+    if (series[i] > series[i - 1] && series[i] > series[i + 1]) {
+      peaks.push(i);
+    }
+  }
+  return peaks;
 }
 
-// ─── Cadencia real por ciclos de tobillo ──────────────────────────────────────
+function detectValleys(series: number[]): number[] {
+  const valleys: number[] = [];
+  for (let i = 1; i < series.length - 1; i++) {
+    if (series[i] < series[i - 1] && series[i] < series[i + 1]) {
+      valleys.push(i);
+    }
+  }
+  return valleys;
+}
 
-function detectRealCadence(
+function estimateBodyHeight(frames: FrameLandmarks[]): number {
+  if (!frames.length) return 1;
+  // Distancia promedio cabeza–tobillo como proxy de altura
+  const heights = frames.map(f => {
+    if (!f.leftAnkle || !f.nose) return 0;
+    return Math.abs(f.nose.y - f.leftAnkle.y);
+  }).filter(h => h > 0);
+  return mean(heights) || 1;
+}
+
+// ─── 1. CADENCIA REAL ─────────────────────────────────────────
+
+export function analyzeCadence(
   frames: FrameLandmarks[],
   durationSeconds: number
 ): number {
-  const fallback = clamp(
-    Math.round(
-      (Math.max(8, Math.round(durationSeconds * 2.8)) /
-        Math.max(durationSeconds, 1)) *
-        60
-    ),
-    150,
-    186
-  );
+  if (frames.length < 10 || durationSeconds <= 0) return 0;
 
-  if (frames.length < 4) return fallback;
+  // Extraer serie Y del tobillo derecho (baja = contacto suelo)
+  const rawSeries = frames.map(f => f.rightAnkle?.y ?? 0);
+  const smoothed = smoothSeries(rawSeries, 7);
 
-  const ankleYSeries = frames.map((f) => f.rightAnkle.y);
+  // Detectar valles (momentos de contacto con el suelo)
+  const valleys = detectValleys(smoothed);
 
-  // Suavizado de ventana 3
-  const smoothed = ankleYSeries.map((v, i) => {
-    const prev = ankleYSeries[Math.max(0, i - 1)];
-    const next = ankleYSeries[Math.min(ankleYSeries.length - 1, i + 1)];
-    return (prev + v + next) / 3;
-  });
-
-  // Mediana como threshold
-  const sorted = [...smoothed].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-
-  // Cruces descendentes = pasos del pie derecho
-  // MediaPipe: Y crece hacia abajo → tobillo sube = Y baja = cruza mediana descendiendo
-  let steps = 0;
-  for (let i = 1; i < smoothed.length; i++) {
-    if (smoothed[i - 1] >= median && smoothed[i] < median) {
-      steps++;
+  // Filtrar valles muy cercanos (ruido) — mínimo 10 frames entre pasos
+  const filteredValleys: number[] = [];
+  for (const v of valleys) {
+    if (!filteredValleys.length || v - filteredValleys[filteredValleys.length - 1] > 10) {
+      filteredValleys.push(v);
     }
   }
 
-  const cadence = Math.round(
-    (steps * 2 * 60) / Math.max(durationSeconds, 1)
-  );
+  // Calcular ciclos (2 pasos = 1 ciclo de zancada)
+  const steps = filteredValleys.length;
+  const cycles = steps / 2;
 
-  if (cadence < 100 || cadence > 220) return fallback;
-  return clamp(cadence, 140, 210);
+  // Cadencia = ciclos por minuto
+  const cadence = Math.round((cycles * 60) / durationSeconds);
+
+  return clamp(cadence, 100, 220);
 }
 
-// ─── Overstride real ──────────────────────────────────────────────────────────
+// ─── 2. OVERSTRIDE REAL ───────────────────────────────────────
 
-function detectOverstride(frames: FrameLandmarks[]): {
-  magnitude: number;
-  band: MetricBand;
-} {
-  const ratios = frames.map((f) => {
-    const shoulderY = avgPoint(f.leftShoulder, f.rightShoulder).y;
-    const ankleY = (f.leftAnkle.y + f.rightAnkle.y) / 2;
-    const bodyHeight = Math.max(Math.abs(ankleY - shoulderY), 0.01);
-
-    const lFwd = Math.max(0, f.leftAnkle.x - f.leftHip.x) / bodyHeight;
-    const rFwd = Math.max(0, f.rightAnkle.x - f.rightHip.x) / bodyHeight;
-    const lBwd = Math.max(0, f.leftHip.x - f.leftAnkle.x) / bodyHeight;
-    const rBwd = Math.max(0, f.rightHip.x - f.rightAnkle.x) / bodyHeight;
-
-    return Math.max(lFwd, rFwd, lBwd, rBwd);
-  });
-
-  const magnitude = mean(ratios);
-  return {
-    magnitude: Number(magnitude.toFixed(3)),
-    band: band(magnitude, 0.08, 0.15),
-  };
-}
-
-// ─── Hip Drop real ────────────────────────────────────────────────────────────
-
-function detectHipDrop(frames: FrameLandmarks[]): {
-  magnitude: number;
-  band: MetricBand;
-} {
-  const drops = frames.map((f) => {
-    const hipWidth = Math.max(Math.abs(f.leftHip.x - f.rightHip.x), 0.01);
-    const vertDiff = Math.abs(f.leftHip.y - f.rightHip.y);
-    return (Math.atan2(vertDiff, hipWidth) * 180) / Math.PI;
-  });
-
-  const magnitude = mean(drops);
-  return {
-    magnitude: Number(magnitude.toFixed(2)),
-    band: band(magnitude, 3.5, 7.0),
-  };
-}
-
-// ─── Asimetría ────────────────────────────────────────────────────────────────
-
-function detectAsymmetry(frames: FrameLandmarks[]): {
-  percent: number;
-  band: MetricBand;
-} {
-  const left = mean(frames.map((f) => Math.abs(f.leftAnkle.x - f.leftHip.x)));
-  const right = mean(
-    frames.map((f) => Math.abs(f.rightAnkle.x - f.rightHip.x))
-  );
-  const avg = (left + right) / 2;
-  const percent = avg > 0 ? (Math.abs(left - right) / avg) * 100 : 0;
-
-  return {
-    percent: Number(percent.toFixed(1)),
-    band: band(percent, 6, 11),
-  };
-}
-
-// ─── Tronco ───────────────────────────────────────────────────────────────────
-
-function detectTrunkPosition(frames: FrameLandmarks[]): {
-  angleDeg: number;
-  label: string;
-} {
-  const angles = frames.map((f) => {
-    const sc = avgPoint(f.leftShoulder, f.rightShoulder);
-    const hc = avgPoint(f.leftHip, f.rightHip);
-    const dx = sc.x - hc.x;
-    const dy = hc.y - sc.y;
-    return Math.abs((Math.atan2(dx, dy) * 180) / Math.PI);
-  });
-
-  const angleDeg = mean(angles);
-  const label =
-    angleDeg > 15
-      ? "Inestabilidad lateral"
-      : angleDeg > 8
-      ? "Leve inclinación"
-      : angleDeg >= 3
-      ? "Estable"
-      : "Demasiado vertical";
-
-  return { angleDeg: Number(angleDeg.toFixed(1)), label };
-}
-
-// ─── Control de impacto ───────────────────────────────────────────────────────
-
-function detectImpactControl(
+export function analyzeOverstride(
   frames: FrameLandmarks[],
-  overstrideBand: MetricBand,
+  bodyHeight: number
+): OverstrideResult {
+  if (!frames.length || bodyHeight <= 0) {
+    return { value: 0, label: "Eficiente", risk: "Bajo" };
+  }
+
+  // Encontrar frames de contacto (tobillo en punto más bajo local)
+  const ankleY = frames.map(f => f.rightAnkle?.y ?? 0);
+  const smoothed = smoothSeries(ankleY, 5);
+  const contactFrames = detectValleys(smoothed);
+
+  if (!contactFrames.length) {
+    return { value: 0, label: "Eficiente", risk: "Bajo" };
+  }
+
+  // En cada contacto, medir distancia horizontal tobillo–cadera
+  const ratios = contactFrames.map(idx => {
+    const frame = frames[idx];
+    if (!frame?.rightAnkle || !frame?.rightHip) return 0;
+    const horizontalDist = frame.rightAnkle.x - frame.rightHip.x;
+    return Math.abs(horizontalDist) / bodyHeight;
+  }).filter(r => r > 0);
+
+  const avgRatio = mean(ratios);
+
+  let label: OverstrideResult["label"];
+  let risk: OverstrideResult["risk"];
+
+  if (avgRatio < 0.08) {
+    label = "Eficiente"; risk = "Bajo";
+  } else if (avgRatio < 0.15) {
+    label = "Moderado"; risk = "Medio";
+  } else {
+    label = "Severo"; risk = "Alto";
+  }
+
+  return { value: parseFloat(avgRatio.toFixed(3)), label, risk };
+}
+
+// ─── 3. HIP DROP REAL ─────────────────────────────────────────
+
+export function analyzeHipDrop(frames: FrameLandmarks[], bodyHeight: number): HipDropResult {
+  if (!frames.length || bodyHeight <= 0) {
+    return { value: 0, label: "Estable", side: "simétrico" };
+  }
+
+  // Calcular diferencia entre cadera izquierda y derecha en cada frame
+  const drops = frames.map(f => {
+    const lh = f.leftHip?.y ?? null;
+    const rh = f.rightHip?.y ?? null;
+    if (lh === null || rh === null) return null;
+    return { diff: lh - rh, frame: f };
+  }).filter((d): d is { diff: number; frame: FrameLandmarks } => d !== null);
+
+  if (!drops.length) return { value: 0, label: "Estable", side: "simétrico" };
+
+  // Separar fases de apoyo unilateral (cuando un tobillo está más bajo)
+  const leftSupport = drops.filter(d => (d.frame.leftAnkle?.y ?? 0) > (d.frame.rightAnkle?.y ?? 0));
+  const rightSupport = drops.filter(d => (d.frame.rightAnkle?.y ?? 0) > (d.frame.leftAnkle?.y ?? 0));
+
+  const leftDrop = leftSupport.length ? Math.abs(mean(leftSupport.map(d => d.diff))) : 0;
+  const rightDrop = rightSupport.length ? Math.abs(mean(rightSupport.map(d => d.diff))) : 0;
+
+  const maxDrop = Math.max(leftDrop, rightDrop);
+  const normalizedDrop = maxDrop / bodyHeight;
+
+  let label: HipDropResult["label"];
+  if (normalizedDrop < 0.02) label = "Estable";
+  else if (normalizedDrop < 0.05) label = "Leve";
+  else if (normalizedDrop < 0.09) label = "Moderado";
+  else label = "Severo";
+
+  const side: HipDropResult["side"] =
+    Math.abs(leftDrop - rightDrop) < 0.01 ? "simétrico"
+    : leftDrop > rightDrop ? "izquierdo"
+    : "derecho";
+
+  return { value: parseFloat(normalizedDrop.toFixed(3)), label, side };
+}
+
+// ─── 4. ASIMETRÍA REAL ────────────────────────────────────────
+
+export function analyzeAsymmetry(frames: FrameLandmarks[]): AsymmetryResult {
+  if (frames.length < 20) return { value: 0, label: "Mínima" };
+
+  // Comparar amplitud de movimiento tobillo izquierdo vs derecho
+  const leftY = frames.map(f => f.leftAnkle?.y ?? 0);
+  const rightY = frames.map(f => f.rightAnkle?.y ?? 0);
+
+  const leftAmp = Math.max(...leftY) - Math.min(...leftY);
+  const rightAmp = Math.max(...rightY) - Math.min(...rightY);
+
+  const avgAmp = (leftAmp + rightAmp) / 2;
+  if (avgAmp === 0) return { value: 0, label: "Mínima" };
+
+  const asymmetryRatio = Math.abs(leftAmp - rightAmp) / avgAmp;
+
+  // Comparar también ciclos de tiempo entre izquierdo y derecho
+  const leftPeaks = detectPeaks(smoothSeries(leftY)).length;
+  const rightPeaks = detectPeaks(smoothSeries(rightY)).length;
+  const peakAsymmetry = leftPeaks && rightPeaks
+    ? Math.abs(leftPeaks - rightPeaks) / Math.max(leftPeaks, rightPeaks)
+    : 0;
+
+  const combinedAsymmetry = (asymmetryRatio + peakAsymmetry) / 2;
+
+  let label: AsymmetryResult["label"];
+  if (combinedAsymmetry < 0.05) label = "Mínima";
+  else if (combinedAsymmetry < 0.10) label = "Leve";
+  else if (combinedAsymmetry < 0.18) label = "Significativa";
+  else label = "Severa";
+
+  return { value: parseFloat(combinedAsymmetry.toFixed(3)), label };
+}
+
+// ─── 5. TRONCO REAL ───────────────────────────────────────────
+
+export function analyzeTrunkPosition(frames: FrameLandmarks[]): TrunkResult {
+  if (!frames.length) return { angleDeg: 0, label: "Vertical" };
+
+  const angles = frames.map(f => {
+    const ls = f.leftShoulder;
+    const rs = f.rightShoulder;
+    const lh = f.leftHip;
+    const rh = f.rightHip;
+    if (!ls || !rs || !lh || !rh) return null;
+
+    // Centro de hombros y caderas
+    const shoulderCenterX = (ls.x + rs.x) / 2;
+    const shoulderCenterY = (ls.y + rs.y) / 2;
+    const hipCenterX = (lh.x + rh.x) / 2;
+    const hipCenterY = (lh.y + rh.y) / 2;
+
+    // Ángulo respecto a la vertical
+    const dx = shoulderCenterX - hipCenterX;
+    const dy = shoulderCenterY - hipCenterY;
+    return Math.atan2(dx, Math.abs(dy)) * (180 / Math.PI);
+  }).filter((a): a is number => a !== null);
+
+  if (!angles.length) return { angleDeg: 0, label: "Vertical" };
+
+  const avgAngle = mean(angles);
+
+  let label: TrunkResult["label"];
+  if (Math.abs(avgAngle) < 5) label = "Vertical";
+  else if (avgAngle > 0 && avgAngle < 15) label = "Inclinado adelante";
+  else if (avgAngle < 0) label = "Inclinado atrás";
+  else label = "Flexión excesiva";
+
+  return { angleDeg: parseFloat(avgAngle.toFixed(1)), label };
+}
+
+// ─── 6. CONTROL DE IMPACTO ────────────────────────────────────
+
+export function analyzeImpactControl(
+  frames: FrameLandmarks[],
+  overstride: OverstrideResult,
   cadence: number
-): MetricBand {
-  const hipVerticals = frames.map(
-    (f) => avgPoint(f.leftHip, f.rightHip).y
-  );
-  const vertVar =
-    Math.max(...hipVerticals) - Math.min(...hipVerticals);
+): ImpactResult {
+  if (!frames.length) {
+    return { pattern: "Indeterminado", risk: "Medio", label: "Sin datos suficientes" };
+  }
 
-  const ovPenalty =
-    overstrideBand === "Alta" ? 0.04 : overstrideBand === "Media" ? 0.02 : 0;
-  const cadPenalty = cadence < 160 ? 0.03 : cadence < 170 ? 0.01 : 0;
+  // Aproximar patrón por posición del tobillo vs rodilla en contacto
+  const ankleY = frames.map(f => f.rightAnkle?.y ?? 0);
+  const kneeY = frames.map(f => f.rightKnee?.y ?? 0);
+  const smoothedAnkle = smoothSeries(ankleY, 5);
+  const contactFrames = detectValleys(smoothedAnkle).slice(0, 10);
 
-  return band(vertVar + ovPenalty + cadPenalty, 0.04, 0.08);
+  if (!contactFrames.length) {
+    return { pattern: "Indeterminado", risk: "Medio", label: "No se detectaron contactos claros" };
+  }
+
+  // En frames de contacto, si rodilla está considerablemente más adelante = talón
+  const kneeAheadRatios = contactFrames.map(idx => {
+    const f = frames[idx];
+    if (!f?.rightKnee || !f?.rightAnkle) return 0;
+    return (f.rightKnee.x - f.rightAnkle.x); // positivo = rodilla adelante del tobillo
+  });
+
+  const avgKneeAhead = mean(kneeAheadRatios);
+
+  let pattern: ImpactResult["pattern"];
+  if (avgKneeAhead > 0.05) pattern = "Talón";
+  else if (avgKneeAhead > -0.02) pattern = "Mediopié";
+  else pattern = "Antepié";
+
+  // Riesgo combinado: patrón + overstride + cadencia
+  let riskScore = 0;
+  if (pattern === "Talón") riskScore += 3;
+  else if (pattern === "Mediopié") riskScore += 1;
+  if (overstride.risk === "Alto") riskScore += 3;
+  else if (overstride.risk === "Medio") riskScore += 1;
+  if (cadence < 160) riskScore += 2;
+  else if (cadence < 170) riskScore += 1;
+
+  const risk: ImpactResult["risk"] = riskScore >= 5 ? "Alto" : riskScore >= 3 ? "Medio" : "Bajo";
+
+  const labels: Record<string, string> = {
+    "Talón-Alto": "Aterrizaje de talón con overstride — carga alta en rodilla",
+    "Talón-Medio": "Aterrizaje de talón — mejorable",
+    "Talón-Bajo": "Talón con buena cadencia — aceptable",
+    "Mediopié-Alto": "Mediopié con zancada larga — revisar cadencia",
+    "Mediopié-Medio": "Mediopié — patrón funcional",
+    "Mediopié-Bajo": "Mediopié eficiente",
+    "Antepié-Alto": "Antepié con overstride — poco frecuente, revisar",
+    "Antepié-Medio": "Antepié con esfuerzo en gemelos",
+    "Antepié-Bajo": "Antepié — patrón eficiente",
+  };
+
+  const label = labels[`${pattern}-${risk}`] ?? `${pattern} — riesgo ${risk}`;
+
+  return { pattern, risk, label };
 }
 
-// ─── Prioridad ────────────────────────────────────────────────────────────────
+// ─── 7. PRIORIDAD ÚNICA ───────────────────────────────────────
 
-function getPriorityFocus(
-  metrics: BiomechanicsMetrics,
-  athleteLevel: string
-): string {
-  if (athleteLevel === "Principiante" && metrics.cadenceLow)
-    return "Aumentar cadencia a 170–175 spm";
-  if (metrics.overstriding === "Alta")
-    return "Reducir overstride — acortar zancada";
-  if (metrics.hipDrop === "Alta")
-    return "Estabilidad pélvica — fortalecer glúteo medio";
-  if (metrics.asymmetry === "Alta")
-    return "Corregir asimetría — investigar compensación";
-  if (metrics.cadenceLow)
-    return "Aumentar cadencia a 170–175 spm";
-  if (metrics.overstriding === "Media")
-    return "Optimizar aterrizaje — zancada más corta";
-  if (metrics.trunkPosition === "Inestabilidad lateral")
-    return "Estabilizar tronco — core y postura";
-  return "Mantener y consolidar técnica actual";
+export function getPriorityFocus(metrics: BiomechanicsMetrics, cadence: number): string {
+  // Orden de prioridad clínica: primero lo que más lesiona
+  if (metrics.overstride.label === "Severo") return "Reducir overstride urgente";
+  if (metrics.hipDrop.label === "Severo") return "Estabilizar cadera";
+  if (metrics.asymmetry.label === "Severa") return "Corregir asimetría";
+  if (cadence < 155) return "Aumentar cadencia";
+  if (metrics.overstride.label === "Moderado") return "Acortar la zancada";
+  if (metrics.hipDrop.label === "Moderado") return "Fortalecer glúteo medio";
+  if (metrics.asymmetry.label === "Significativa") return "Igualar impulso bilateral";
+  if (metrics.trunkPosition.label === "Flexión excesiva") return "Corregir postura de tronco";
+  if (metrics.impactControl.risk === "Alto") return "Mejorar patrón de aterrizaje";
+  if (cadence < 165) return "Optimizar cadencia";
+  return "Mantener y consolidar técnica";
 }
 
-// ─── Riesgo ───────────────────────────────────────────────────────────────────
+// ─── 8. SCORING TÉCNICO ───────────────────────────────────────
 
-function getRiskLevel(metrics: BiomechanicsMetrics): RiskLevel {
-  const high = [
-    metrics.overstriding === "Alta",
-    metrics.hipDrop === "Alta",
-    metrics.asymmetry === "Alta",
-    metrics.impactControl === "Alta",
-  ].filter(Boolean).length;
+export function calculateTechnicalScore(metrics: BiomechanicsMetrics, cadence: number): number {
+  let score = 100;
 
-  const medium = [
-    metrics.overstriding === "Media",
-    metrics.hipDrop === "Media",
-    metrics.asymmetry === "Media",
-    metrics.cadenceLow,
-  ].filter(Boolean).length;
+  // Cadencia (peso: 20 puntos)
+  if (cadence < 150) score -= 20;
+  else if (cadence < 160) score -= 12;
+  else if (cadence < 165) score -= 6;
+  else if (cadence > 185) score -= 5;
 
-  if (high >= 2 || (high === 1 && medium >= 2)) return "Alto";
-  if (high === 1 || medium >= 2) return "Medio";
+  // Overstride (peso: 25 puntos)
+  if (metrics.overstride.label === "Severo") score -= 25;
+  else if (metrics.overstride.label === "Moderado") score -= 12;
+
+  // Hip Drop (peso: 20 puntos)
+  if (metrics.hipDrop.label === "Severo") score -= 20;
+  else if (metrics.hipDrop.label === "Moderado") score -= 10;
+  else if (metrics.hipDrop.label === "Leve") score -= 4;
+
+  // Asimetría (peso: 15 puntos)
+  if (metrics.asymmetry.label === "Severa") score -= 15;
+  else if (metrics.asymmetry.label === "Significativa") score -= 8;
+  else if (metrics.asymmetry.label === "Leve") score -= 3;
+
+  // Tronco (peso: 10 puntos)
+  if (metrics.trunkPosition.label === "Flexión excesiva") score -= 10;
+  else if (metrics.trunkPosition.label === "Inclinado atrás") score -= 6;
+
+  // Impacto (peso: 10 puntos)
+  if (metrics.impactControl.risk === "Alto") score -= 10;
+  else if (metrics.impactControl.risk === "Medio") score -= 4;
+
+  return clamp(Math.round(score), 0, 100);
+}
+
+export function calculateRiskScore(metrics: BiomechanicsMetrics, cadence: number): number {
+  let risk = 0;
+
+  if (metrics.overstride.label === "Severo") risk += 35;
+  else if (metrics.overstride.label === "Moderado") risk += 18;
+
+  if (metrics.hipDrop.label === "Severo") risk += 25;
+  else if (metrics.hipDrop.label === "Moderado") risk += 12;
+
+  if (metrics.asymmetry.label === "Severa") risk += 20;
+  else if (metrics.asymmetry.label === "Significativa") risk += 10;
+
+  if (cadence < 155) risk += 15;
+  else if (cadence < 165) risk += 5;
+
+  if (metrics.impactControl.risk === "Alto") risk += 15;
+  else if (metrics.impactControl.risk === "Medio") risk += 6;
+
+  return clamp(Math.round(risk), 0, 100);
+}
+
+export function getRiskLevel(riskScore: number): RiskLevel {
+  if (riskScore >= 70) return "Crítico";
+  if (riskScore >= 45) return "Alto";
+  if (riskScore >= 20) return "Medio";
   return "Bajo";
 }
 
-// ─── Diagnóstico en lenguaje natural ─────────────────────────────────────────
+// ─── 9. DIAGNÓSTICO EN LENGUAJE NATURAL ──────────────────────
 
-function buildNaturalDiagnosis(
+export function generateNaturalDiagnosis(
   metrics: BiomechanicsMetrics,
   cadence: number,
-  riskLevel: RiskLevel,
-  readiness: number,
-  athleteLevel: string
+  technicalScore: number,
+  priorityFocus: string,
+  athleteName?: string
 ): string {
-  const parts: string[] = [];
+  const name = athleteName ? `${athleteName}, ` : "";
+  const greet = name ? `${name}` : "";
 
-  if (metrics.overstriding === "Alta") {
-    parts.push(
-      "Tu pie aterriza adelante de tu centro de masa en la mayoría de las zancadas. Esto frena el impulso y aumenta la carga en rodilla y tibia. El cambio más efectivo ahora es acortar la zancada y subir la cadencia."
-    );
-  } else if (metrics.overstriding === "Media") {
-    parts.push(
-      "Hay un leve aterrizaje adelantado. No es crítico, pero corregirlo mejoraría la eficiencia y reduciría el desgaste articular a largo plazo."
-    );
-  } else {
-    parts.push(
-      "El aterrizaje es eficiente. El pie cae cerca del centro de masa."
-    );
+  // Diagnóstico personalizado según el patrón dominante
+  if (metrics.overstride.label === "Severo") {
+    return `${greet}tu patrón principal de riesgo hoy es el aterrizaje adelantado. Cada zancada genera un freno y una carga extra en rodilla y tibia. Acortar la zancada y subir cadencia a ${Math.max(cadence + 10, 170)} spm sería el cambio más impactante esta semana.`;
+  }
+
+  if (metrics.hipDrop.label === "Severo") {
+    const side = metrics.hipDrop.side !== "simétrico" ? `del lado ${metrics.hipDrop.side}` : "bilateral";
+    return `${greet}tienes una caída de cadera ${side} significativa. Esto indica que el glúteo medio no está activado suficientemente. Antes de aumentar volumen, fortalecer esta zona reducirá el riesgo de lesión en IT band y cadera.`;
+  }
+
+  if (metrics.asymmetry.label === "Severa") {
+    return `${greet}tu patrón de carrera muestra una asimetría importante entre pierna izquierda y derecha. Esto puede indicar una lesión compensada o debilidad unilateral. Recomiendo reducir carga y revisar con fisioterapeuta antes de continuar.`;
   }
 
   if (cadence < 160) {
-    parts.push(
-      `Cadencia de ${cadence} spm — significativamente baja. Subirla a 170–175 spm reduciría el impacto articular y mejoraría la economía de carrera sin cambiar la velocidad.`
-    );
-  } else if (cadence < 170) {
-    parts.push(
-      `Cadencia de ${cadence} spm. Hay margen para subir a 170–175 spm y ganar eficiencia.`
-    );
-  } else {
-    parts.push(`Cadencia de ${cadence} spm — en rango óptimo.`);
+    return `${greet}tu cadencia de ${cadence} spm está por debajo del rango óptimo. Aumentar cadencia es el cambio técnico con mayor retorno: reduce el impacto, acorta la zancada y mejora la economía de carrera automáticamente.`;
   }
 
-  if (metrics.hipDrop === "Alta") {
-    parts.push(
-      "Se detecta caída de cadera considerable. Suele indicar debilidad del glúteo medio y genera sobrecargas en cadena. Priorizar fuerza unilateral antes de aumentar volumen."
-    );
-  } else if (metrics.hipDrop === "Media") {
-    parts.push(
-      "Caída de cadera leve. Ejercicios de estabilidad pélvica preventivos serían beneficiosos."
-    );
+  if (metrics.impactControl.risk === "Alto") {
+    return `${greet}tu patrón de ${metrics.impactControl.pattern.toLowerCase()} combinado con la zancada actual genera carga articular alta. Trabajar en aterrizaje bajo el centro de masa mejoraría el score técnico de ${technicalScore} a más de 80.`;
   }
 
-  if (readiness < 55) {
-    parts.push(
-      "Con readiness bajo, hoy no es el día para empujar. La recuperación activa tiene más valor que cualquier sesión de calidad."
-    );
-  } else if (readiness >= 70) {
-    parts.push("El cuerpo está en condiciones de progresar esta semana.");
+  if (technicalScore >= 80) {
+    return `${greet}tu técnica está en un nivel muy bueno (${technicalScore}/100). La prioridad ahora es consolidar: ${priorityFocus}. Mantén la consistencia y enfócate en no perder forma cuando aumenta la fatiga.`;
   }
 
-  if (riskLevel === "Alto") {
-    parts.push(
-      "Riesgo técnico alto. Antes de aumentar carga, conviene trabajar los patrones detectados."
-    );
-  } else if (riskLevel === "Bajo" && athleteLevel !== "Principiante") {
-    parts.push(
-      "Técnica sólida. El foco ahora puede estar en eficiencia y especificidad para la meta."
-    );
-  }
-
-  return parts.join(" ");
+  return `${greet}tu técnica actual marca ${technicalScore}/100. El área de mayor impacto para mejorar esta semana es: ${priorityFocus}. Pequeños ajustes en esta dirección producirán mejoras medibles en tu próxima sesión.`;
 }
 
-// ─── Frame a overlay ──────────────────────────────────────────────────────────
+// ─── 10. CUES PARA MODO COACH EN VIVO ─────────────────────────
 
-function frameToOverlayPoints(frame: FrameLandmarks): OverlayPoint[] {
-  return [
-    { x: frame.leftShoulder.x, y: frame.leftShoulder.y },
-    { x: frame.rightShoulder.x, y: frame.rightShoulder.y },
-    { x: frame.leftHip.x, y: frame.leftHip.y },
-    { x: frame.rightHip.x, y: frame.rightHip.y },
-    { x: frame.leftKnee.x, y: frame.leftKnee.y },
-    { x: frame.rightKnee.x, y: frame.rightKnee.y },
-    { x: frame.leftAnkle.x, y: frame.leftAnkle.y },
-    { x: frame.rightAnkle.x, y: frame.rightAnkle.y },
-  ];
+export function generateLiveCoachCues(metrics: BiomechanicsMetrics, cadence: number): string[] {
+  const cues: string[] = [];
+
+  if (metrics.overstride.label !== "Eficiente") {
+    cues.push("Aterriza bajo tu cadera, no delante de ti");
+    cues.push("Piensa en 'rueda de bicicleta' — el pie cae debajo del cuerpo");
+  }
+
+  if (cadence < 165) {
+    cues.push(`Sube el ritmo de pasos — busca ${Math.min(cadence + 8, 172)} spm`);
+    cues.push("Pasos más cortos y rápidos, no más largos");
+  }
+
+  if (metrics.hipDrop.label !== "Estable") {
+    cues.push("Activa el glúteo en cada apoyo — empuja el suelo hacia atrás");
+    cues.push("Mantén la cadera nivelada, no la dejes caer al lado");
+  }
+
+  if (metrics.trunkPosition.label === "Flexión excesiva") {
+    cues.push("Levanta el pecho, no te encorves");
+    cues.push("Imagina que un hilo te jala hacia arriba desde la coronilla");
+  }
+
+  if (metrics.asymmetry.label !== "Mínima") {
+    cues.push("Iguala el impulso de ambos brazos");
+    cues.push("Siente que ambas piernas empujan igual");
+  }
+
+  if (!cues.length) {
+    cues.push("¡Técnica excelente! Mantén este patrón");
+    cues.push("Relaja hombros y manos");
+    cues.push("Respira con el ritmo de zancada");
+  }
+
+  return cues;
 }
 
-// ─── Función principal ────────────────────────────────────────────────────────
+// ─── 11. FUNCIÓN PRINCIPAL DE ANÁLISIS ───────────────────────
 
-export function analyzeFromFrames(
+export function analyzeBiomechanics(
   frames: FrameLandmarks[],
   durationSeconds: number,
-  readiness: number,
-  athlete: Athlete
+  athleteName?: string
 ): BiomechanicsResult {
-  const overlayFrames: OverlayFrame[] = frames.map((f) => ({
-    time: f.time,
-    points: frameToOverlayPoints(f),
-  }));
+  if (!frames || frames.length < 15) {
+    return createEmptyResult();
+  }
 
-  const allPoints = frames.flatMap((f) => [
-    f.leftShoulder, f.rightShoulder,
-    f.leftHip, f.rightHip,
-    f.leftKnee, f.rightKnee,
-    f.leftAnkle, f.rightAnkle,
-  ]);
-  const avgConfidence = mean(allPoints.map((p) => p.visibility));
-
-  const shoulderSpread = mean(
-    frames.map((f) => Math.abs(f.leftShoulder.x - f.rightShoulder.x))
-  );
-  const hipSpread = mean(
-    frames.map((f) => Math.abs(f.leftHip.x - f.rightHip.x))
-  );
-  const validLateralView = (shoulderSpread + hipSpread) / 2 < 0.22;
-
-  const fullBodyVisible =
-    frames.filter((f) => {
-      const pts = [
-        f.leftShoulder, f.rightShoulder,
-        f.leftHip, f.rightHip,
-        f.leftKnee, f.rightKnee,
-        f.leftAnkle, f.rightAnkle,
-      ];
-      return pts.every((p) => p.visibility > 0.45 && p.y >= 0 && p.y <= 1);
-    }).length /
-      Math.max(frames.length, 1) >=
-    0.75;
-
-  const hipCenters = frames.map((f) => avgPoint(f.leftHip, f.rightHip));
-  const movementDetected =
-    Math.max(...hipCenters.map((p) => p.x)) -
-      Math.min(...hipCenters.map((p) => p.x)) >
-    0.04;
-
-  const safeReadiness =
-    typeof readiness === "number" && isFinite(readiness) ? readiness : 60;
-
-  const cadence = detectRealCadence(frames, durationSeconds);
-  const overstride = detectOverstride(frames);
-  const hipDrop = detectHipDrop(frames);
-  const asymmetry = detectAsymmetry(frames);
-  const trunk = detectTrunkPosition(frames);
-  const impactControl = detectImpactControl(frames, overstride.band, cadence);
+  const bodyHeight = estimateBodyHeight(frames);
+  const cadence = analyzeCadence(frames, durationSeconds);
+  const overstride = analyzeOverstride(frames, bodyHeight);
+  const hipDrop = analyzeHipDrop(frames, bodyHeight);
+  const asymmetry = analyzeAsymmetry(frames);
+  const trunkPosition = analyzeTrunkPosition(frames);
+  const impactControl = analyzeImpactControl(frames, overstride, cadence);
 
   const metrics: BiomechanicsMetrics = {
-    cadenceRaw: cadence,
-    overstrideMagnitude: overstride.magnitude,
-    hipDropMagnitude: hipDrop.magnitude,
-    asymmetryPercent: asymmetry.percent,
-    trunkAngleDeg: trunk.angleDeg,
-    overstriding: overstride.band,
-    hipDrop: hipDrop.band,
-    asymmetry: asymmetry.band,
+    cadence,
+    overstride,
+    hipDrop,
+    asymmetry,
+    trunkPosition,
     impactControl,
-    trunkPosition: trunk.label,
-    cadenceLow: cadence < 170,
   };
 
-  const penalty =
-    (overstride.band === "Alta" ? 12 : overstride.band === "Media" ? 6 : 0) +
-    (hipDrop.band === "Alta" ? 10 : hipDrop.band === "Media" ? 4 : 0) +
-    (asymmetry.band === "Alta" ? 8 : asymmetry.band === "Media" ? 3 : 0) +
-    (impactControl === "Alta" ? 8 : impactControl === "Media" ? 3 : 0) +
-    (cadence < 160 ? 6 : cadence < 170 ? 3 : 0) +
-    (trunk.label === "Inestabilidad lateral" ? 5 : 0);
-
-  const readinessBonus =
-    safeReadiness >= 70 ? 3 : safeReadiness >= 55 ? 0 : -3;
-  const technicalScore = clamp(
-    Math.round(100 - penalty + readinessBonus),
-    45,
-    97
+  const technicalScore = calculateTechnicalScore(metrics, cadence);
+  const riskScore = calculateRiskScore(metrics, cadence);
+  const riskLevel = getRiskLevel(riskScore);
+  const priorityFocus = getPriorityFocus(metrics, cadence);
+  const naturalLanguageDiagnosis = generateNaturalDiagnosis(
+    metrics, cadence, technicalScore, priorityFocus, athleteName
   );
+  const coachCues = generateLiveCoachCues(metrics, cadence);
 
-  const riskLevel = getRiskLevel(metrics);
-  const priorityFocus = getPriorityFocus(metrics, athlete.level);
-
-  const readinessAdjustment =
-    safeReadiness >= 70
-      ? "Condiciones para progresar esta semana"
-      : safeReadiness >= 55
-      ? "Mantener carga moderada"
-      : "Reducir intensidad — priorizar recuperación";
-
-  const naturalLanguageDiagnosis = buildNaturalDiagnosis(
-    metrics,
-    cadence,
-    riskLevel,
-    safeReadiness,
-    athlete.level
-  );
-
-  const diagnosticNotes = [
-    validLateralView
-      ? "Vista lateral válida para el análisis."
-      : "Vista no completamente lateral — regrabar más de perfil mejora la precisión.",
-    fullBodyVisible
-      ? "Cuerpo completo visible durante el video."
-      : "El cuerpo no se mantiene completo en todos los frames.",
-    avgConfidence >= 0.6
-      ? `Confianza de detección suficiente (${Math.round(avgConfidence * 100)}%).`
-      : "Confianza de detección baja — mejorar iluminación o calidad de video.",
-    movementDetected
-      ? "Desplazamiento horizontal detectado correctamente."
-      : "Desplazamiento limitado — asegurarse de correr durante el video.",
-    readinessAdjustment,
-  ];
+  // Ajuste de readiness según riesgo
+  const readinessAdjustment = riskScore >= 60 ? -0.3 : riskScore >= 35 ? -0.1 : 0;
 
   return {
     technicalScore,
     riskLevel,
+    riskScore,
     priorityFocus,
     cadence,
     metrics,
     naturalLanguageDiagnosis,
-    videoQualityScore: Number(
-      clamp(avgConfidence + 0.05, 0.65, 0.98).toFixed(2)
-    ),
     readinessAdjustment,
-    overlayFrames,
-    diagnosticNotes,
-    averagePoseConfidence: Number(avgConfidence.toFixed(2)),
-    validLateralView,
-    movementDetected,
-    fullBodyVisible,
+    coachCues,
+  };
+}
+
+function createEmptyResult(): BiomechanicsResult {
+  return {
+    technicalScore: 0,
+    riskLevel: "Bajo",
+    riskScore: 0,
+    priorityFocus: "Capturar más frames para análisis",
+    cadence: 0,
+    metrics: {
+      cadence: 0,
+      overstride: { value: 0, label: "Eficiente", risk: "Bajo" },
+      hipDrop: { value: 0, label: "Estable", side: "simétrico" },
+      asymmetry: { value: 0, label: "Mínima" },
+      trunkPosition: { angleDeg: 0, label: "Vertical" },
+      impactControl: { pattern: "Indeterminado", risk: "Bajo", label: "Sin datos" },
+    },
+    naturalLanguageDiagnosis: "Necesito más datos para darte un diagnóstico preciso. Graba al menos 10 segundos corriendo.",
+    readinessAdjustment: 0,
+    coachCues: ["Graba más tiempo para que pueda verte bien"],
   };
 }
