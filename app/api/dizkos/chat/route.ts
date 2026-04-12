@@ -25,7 +25,7 @@ function buildSystemPrompt(context: {
 - Riesgo: ${analysis.riskLevel} (${analysis.riskScore}/100)
 - Prioridad de esta semana: ${analysis.priorityFocus}
 - Cadencia: ${analysis.cadence} spm
-- Overstride: ${analysis.metrics?.overstriding ?? analysis.analysis?.overstriding ?? "—"}
+- Overstride: ${analysis.metrics?.overstride ?? analysis.analysis?.overstride ?? "—"}
 - Hip drop: ${analysis.metrics?.hipDrop ?? analysis.analysis?.hipDrop ?? "—"}
 - Asimetría: ${analysis.metrics?.asymmetry ?? analysis.analysis?.asymmetry ?? "—"}
 - Tronco: ${analysis.metrics?.trunkPosition ?? analysis.analysis?.trunkPosition ?? "—"}
@@ -139,4 +139,20 @@ export async function POST(request: NextRequest) {
       }),
     });
 
-    if
+
+    if (!response.ok) {
+      return NextResponse.json(
+        { error: `Error de OpenAI: ${response.status}` },
+        { status: response.status }
+      );
+    }
+
+    const json = await response.json();
+    const message = json.choices?.[0]?.message?.content ?? "";
+
+    return NextResponse.json({ message });
+  } catch (err) {
+    console.error("Chat error:", err);
+    return NextResponse.json({ error: "Error interno del servidor" }, { status: 500 });
+  }
+}
