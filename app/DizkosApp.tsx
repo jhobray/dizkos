@@ -179,8 +179,13 @@ export default function DizkosApp() {
   }, [isLiveCoach, analysis]);
 
   async function loadAthletes() {
-    const { data } = await supabase.from("athletes").select("*").order("name");
-    if (data) setAthletes(data);
+    try {
+      const { data, error } = await supabase.from("athletes").select("*").order("name");
+      if (error) { console.error("Error cargando atletas:", error); return; }
+      if (data) setAthletes(data);
+    } catch (err) {
+      console.error("Error inesperado en loadAthletes:", err);
+    }
   }
 
   async function selectAthlete(athlete: Athlete) {
@@ -193,6 +198,7 @@ export default function DizkosApp() {
     }]);
 
     // Cargar historial de análisis
+    try {
     const res = await fetch(`/api/dizkos/analysis?athleteId=${athlete.id}`);
     if (res.ok) {
       const { records } = await res.json();
@@ -200,6 +206,9 @@ export default function DizkosApp() {
         setAnalysisHistory(records);
         setAnalysis(records[0]); // Mostrar el más reciente
       }
+    }
+    } catch (err) {
+      console.error("Error cargando historial:", err);
     }
   }
 
@@ -235,11 +244,11 @@ export default function DizkosApp() {
     };
 
     setAnalysis(result);
-    setIsAnalyzing(false);
     setActiveTab("dashboard");
 
     // Guardar en Supabase
-    await fetch("/api/dizkos/analysis", {
+    try {
+    const saveRes = await fetch("/api/dizkos/analysis", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -247,6 +256,12 @@ export default function DizkosApp() {
         ...result,
       }),
     });
+      if (!saveRes.ok) { console.error("Error guardando analisis en Supabase"); }
+    } catch (err) {
+      console.error("Error en fetch de analisis:", err);
+    } finally {
+      setIsAnalyzing(false);
+    }
 
     // Auto-mensaje del coach
     const autoMsg: ChatMessage = {
