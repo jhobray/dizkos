@@ -36,14 +36,25 @@ export function DizkosCoachChat({ athlete, analysis, garmin }: Props) {
       const res = await fetch("/api/dizkos/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, athlete, analysis, garmin }),
+        body: JSON.stringify({
+          messages: [
+            ...messages.map((m) => ({
+              role: m.role === "ai" ? "assistant" : m.role,
+              content: m.text,
+            })),
+            { role: "user", content: text },
+          ],
+          athlete,
+          analysis,
+          garmin,
+        }),
       });
       const data = await res.json();
       setMessages((prev) => [
         ...prev,
         {
           role: "ai",
-          text: data.reply ?? "Sin respuesta.",
+          text: data.message ?? "Sin respuesta.",
           timestamp: Date.now(),
         },
       ]);
